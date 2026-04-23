@@ -1,0 +1,234 @@
+version: '3.8'
+
+x-airflow-common:
+  &airflow-common
+  image: apache/airflow:2.7.1
+  environment:
+    &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    AIRFLOW__CORE__DAGBAG_IMPORT_TIMEOUT: 60
+    AIRFLOW__WEBSERVER__RBAC: 'true'
+    AIRFLOW__CONNECTION__MINIO_DEFAULT: minio://minioadmin:minioadmin@minio:9000?secure=False
+    AIRFLOW__CONNECTION__POSTGRES_DWH: postgresql://dwh_user:dwh_password@postgres_dwh:5432/data_warehouse
+    _PIP_ADDITIONAL_REQUIREMENTS: apache-airflow-providers-postgres apache-airflow-providers-common-sql minio pandas psycopg2-binary
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./logs:/opt/airflow/logs
+    - ./plugins:/opt/airflow/plugins
+    - ./data:/opt/airflow/data
+  depends_on:
+    postgres:
+      condition: service_healthy
+    postgres_dwh:
+      condition: service_healthy
+    minio:
+      condition: service_healthy
+  user: "${AIRFLOW_UID:-50000}:0"
+
+services:
+  # ============================================
+  # 1. PostgreSQL для метаданных Airflow
+  # ============================================
+  postgres:
+    image: postgres:13
+    container_name: airflow_postgres_metadata
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres-db-volume:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 5s
+      retries: 5
+      timeout: 5s
+    restart: always
+    ports:
+      - "5432:5432"
+    networks:
+      - data-platform-network
+
+  # ============================================
+  # 2. PostgreSQL для Data Warehouse (DWH)
+  # ============================================
+  postgres_dwh:
+    image: postgres:13
+    container_name: postgres_dwh
+    environment:
+      POSTGRES_USER: dwh_user
+      POSTGRES_PASSWORD: dwh_password
+      POSTGRES_DB: data_warehouse
+    volumes:
+      - postgres-dwh-volume:/var/lib/postgresql/data
+      - ./init_dwh.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "dwh_user", "-d", "data_warehouse"]
+      interval: 5s
+      retries: 5
+      timeout: 5s
+    restart: always
+    ports:
+      - "5433:5432"
+    networks:
+      - data-platform-network
+
+  # ============================================
+  # 3. MinIO (S3-совместимое хранилище / Data Lake)
+  # ============================================
+  minio:
+    image: minio/minio:latest
+    container_name: minio
+    ports:
+      - "9000:9000"   # API порт для подключения
+      - "9001:9001"   # Web UI Console
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    networks:
+      - data-platform-network
+
+  # ============================================
+  # 4. Metabase (BI инструмент для дашбордов)
+  # ============================================
+  metabase:
+    image: metabase/metabase:latest
+    container_name: metabase
+    ports:
+      - "3000:3000"
+    environment:
+      MB_DB_TYPE: postgres
+      MB_DB_DBNAME: metabase
+      MB_DB_PORT: 5432
+      MB_DB_USER: airflow
+      MB_DB_PASS: airflow
+      MB_DB_HOST: postgres
+    volumes:
+      - metabase-data:/metabase.db
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - data-platform-network
+
+  # ============================================
+  # 5. Airflow Webserver
+  # ============================================
+  airflow-webserver:
+    <<: *airflow-common
+    container_name: airflow_webserver
+    command: webserver
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    depends_on:
+      postgres:
+        condition: service_healthy
+      postgres_dwh:
+        condition: service_healthy
+    networks:
+      - data-platform-network
+
+  # ============================================
+  # 6. Airflow Scheduler
+  # ============================================
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: airflow_scheduler
+    command: scheduler
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8793/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    depends_on:
+      postgres:
+        condition: service_healthy
+      postgres_dwh:
+        condition: service_healthy
+      # airflow-webserver:
+        # condition: service_healthy
+    networks:
+      - data-platform-network
+
+  # ============================================
+  # 7. Airflow Init (для создания пользователя)
+  # ============================================
+  airflow-init:
+    <<: *airflow-common
+    container_name: airflow_init
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        airflow db init
+        airflow users create \
+          --username admin \
+          --password admin \
+          --firstname Admin \
+          --lastname User \
+          --role Admin \ 
+          --email admin@example.com
+        airflow connections add 'minio_default' \
+          --conn-type 'minio' \
+          --conn-host 'minio' \
+          --conn-port '9000' \
+          --conn-login 'minioadmin' \
+          --conn-password 'minioadmin' \
+          --conn-extra '{"secure": false}'
+        airflow connections add 'postgres_dwh' \
+          --conn-type 'postgres' \
+          --conn-host 'postgres_dwh' \
+          --conn-port '5432' \
+          --conn-login 'dwh_user' \
+          --conn-password 'dwh_password' \
+          --conn-schema 'data_warehouse'
+        exit 0
+    depends_on:
+      postgres:
+        condition: service_healthy
+      postgres_dwh:
+        condition: service_healthy
+    networks:
+      - data-platform-network
+
+# ============================================
+# Volumes (персистентное хранение данных)
+# ============================================
+volumes:
+  postgres-db-volume:
+    name: airflow_postgres_data
+  postgres-dwh-volume:
+    name: postgres_dwh_data
+  minio-data:
+    name: minio_data
+  metabase-data:
+    name: metabase_data
+
+# ============================================
+# Networks
+# ============================================
+networks:
+  data-platform-network:
+    name: data_platform_network
+    driver: bridge
