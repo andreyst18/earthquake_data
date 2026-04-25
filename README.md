@@ -17,3 +17,4 @@ https://earthquake.usgs.gov/fdsnws/event/1/
 Работа с docker:
 Запуск контейнера: docker-compose up -d
 Остановка контейнера: docker-compose stop
+После завершения работы: docker compose down

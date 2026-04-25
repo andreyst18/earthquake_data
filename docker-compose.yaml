@@ -2,7 +2,8 @@ version: '3.8'
 
 x-airflow-common:
   &airflow-common
-  image: apache/airflow:2.7.1
+  # image: apache/airflow:2.7.1
+  build: .
   environment:
     &airflow-common-env
     AIRFLOW__CORE__EXECUTOR: LocalExecutor
@@ -12,7 +13,7 @@ x-airflow-common:
     AIRFLOW__WEBSERVER__RBAC: 'true'
     AIRFLOW__CONNECTION__MINIO_DEFAULT: minio://minioadmin:minioadmin@minio:9000?secure=False
     AIRFLOW__CONNECTION__POSTGRES_DWH: postgresql://dwh_user:dwh_password@postgres_dwh:5432/data_warehouse
-    _PIP_ADDITIONAL_REQUIREMENTS: apache-airflow-providers-postgres apache-airflow-providers-common-sql minio pandas psycopg2-binary
+    _PIP_ADDITIONAL_REQUIREMENTS: apache-airflow-providers-postgres apache-airflow-providers-common-sql minio pandas psycopg2-binary 
   volumes:
     - ./dags:/opt/airflow/dags
     - ./logs:/opt/airflow/logs
